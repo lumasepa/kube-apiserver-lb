@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -44,17 +45,26 @@ type apiServerLb struct {
 	HealthyServers []string
 	rrCounter int
 	healthCheckRules HealthCheck
+	httpClient *http.Client
 }
 
 func (lb *apiServerLb) startHealthChecks() {
 	for {
 		newHealthyServers := make([]string, 0)
 		for _, server := range lb.RemoteServers {
-			// TODO add timeout
-			resp, err := http.Get(fmt.Sprintf("https://%s/healthz", server))
+			resp, err := lb.httpClient.Get(fmt.Sprintf("https://%s/healthz", server))
 
 			if err == nil && resp.StatusCode == 200 {
 				newHealthyServers = append(newHealthyServers, server)
+			} else {
+				var errStr string
+
+				if err != nil {
+					errStr = err.Error()
+				} else {
+					errStr = fmt.Sprintf("HTTP status code : %d", resp.StatusCode)
+				}
+				log.Printf("kube-apiserver %s is not healthy : %s", server, errStr)
 			}
 		}
 
@@ -66,7 +76,7 @@ func (lb *apiServerLb) startHealthChecks() {
 func (lb *apiServerLb) chooseRemote() (string, error) {
 	numberOfHealthyRemotes := len(lb.HealthyServers)
 	if numberOfHealthyRemotes == 0 {
-		return "", errors.New("No remote servers are Healthy")
+		return "", errors.New("no remote servers are Healthy")
 	}
 	picked := lb.rrCounter % numberOfHealthyRemotes
 	return lb.HealthyServers[picked], nil
@@ -84,19 +94,19 @@ func (lb *apiServerLb) Start() error {
 	for {
 		localConn, err := listener.Accept()
 		if err != nil {
-			log.Println("Error accepting connections in lb : %s", err)
+			log.Printf("Error accepting connections in lb : %s", err)
 			return err
 		}
 
 		remote, err := lb.chooseRemote()
 		if err != nil {
-			log.Println("Error trying to forward: %s\n", err)
+			log.Printf("Error trying to forward: %s\n", err)
 			continue
 		}
 
 		remoteConn, err := net.Dial("tcp", remote)
 		if err != nil {
-			log.Println("Error trying to forward: %s\n", err)
+			log.Printf("Error trying to forward: %s\n", err)
 			continue
 		}
 
@@ -131,6 +141,15 @@ func main() {
 		panic(err)
 	}
 
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+
+	client := &http.Client{
+		Transport: tr,
+		Timeout: 5 * time.Second,
+	}
+
 	for {
 		lb := apiServerLb{
 			HealthyServers: make([]string, 0),
@@ -138,6 +157,7 @@ func main() {
 			RemoteServers: config.KubeApiServers,
 			rrCounter: 1,
 			healthCheckRules: config.HealthCheck,
+			httpClient: client,
 		}
 		err := lb.Start()
 		if err != nil {
