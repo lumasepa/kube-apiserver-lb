@@ -2,19 +2,48 @@ package main
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"time"
+	"gopkg.in/yaml.v2"
 )
+
+type HealthCheck struct {
+	Period int `yaml:"check_period"`
+	UpThreshold int `yaml:"up_threshold"`
+	DownThreshold int `yaml:"down_threshold"`
+}
+
+type Configuration struct {
+	KubeApiServers []string `yaml:"kube_apiservers"`;
+	ListenAddr string `yaml:"listen_addr"`
+	HealthCheck HealthCheck `yaml:"health_check"`
+}
+
+func readConfiguration(path string) (*Configuration, error) {
+	data, err := ioutil.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	config := &Configuration{}
+	err = yaml.Unmarshal(data, &config)
+	if err != nil {
+		return nil, err
+	}
+	return config, nil
+}
 
 type apiServerLb struct {
 	Local  string
 	RemoteServers []string
 	HealthyServers []string
 	rrCounter int
+	healthCheckRules HealthCheck
 }
 
 func (lb *apiServerLb) startHealthChecks() {
@@ -30,7 +59,7 @@ func (lb *apiServerLb) startHealthChecks() {
 		}
 
 		lb.HealthyServers = newHealthyServers
-		time.Sleep(30 * time.Second)
+		time.Sleep(time.Duration(lb.healthCheckRules.Period) * time.Second)
 	}
 }
 
@@ -94,16 +123,25 @@ func (lb *apiServerLb) forward(localConn net.Conn, remoteConn net.Conn) {
 
 
 func main() {
+	path := flag.String("config", "./config.yaml", "config file")
+	flag.Parse()
+
+	config, err := readConfiguration(*path)
+	if err != nil {
+		panic(err)
+	}
+
 	for {
 		lb := apiServerLb{
 			HealthyServers: make([]string, 0),
-			Local: "127.0.0.1:6443",
-			RemoteServers: []string{"10.0.0.101:6443", "10.0.0.102:6443", "10.0.0.103:6443"},
+			Local: config.ListenAddr,
+			RemoteServers: config.KubeApiServers,
 			rrCounter: 1,
+			healthCheckRules: config.HealthCheck,
 		}
 		err := lb.Start()
 		if err != nil {
-			log.Println("Restarting lb because of HARD error: %s", err)
+			log.Printf("Restarting lb because of HARD error: %s", err)
 		}
 
 		time.Sleep(1 * time.Second)

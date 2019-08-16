@@ -1,0 +1,11 @@
+kube_apiservers:
+  - 10.0.0.101:6443
+  - 10.0.0.102:6443
+  - 10.0.0.103:6443
+
+listen_addr: 127.0.0.1:6443
+
+health_check:
+  check_period: 30
+  up_threshold: 1
+  down_threshold: 1
