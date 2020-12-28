@@ -5,13 +5,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"gopkg.in/yaml.v2"
 	"io"
 	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"time"
-	"gopkg.in/yaml.v2"
 )
 
 type HealthCheck struct {
@@ -21,7 +21,7 @@ type HealthCheck struct {
 }
 
 type Configuration struct {
-	KubeApiServers []string `yaml:"kube_apiservers"`;
+	KubeApiServers []string `yaml:"kube_apiservers"`
 	ListenAddr string `yaml:"listen_addr"`
 	HealthCheck HealthCheck `yaml:"health_check"`
 }
@@ -42,13 +42,13 @@ func readConfiguration(path string) (*Configuration, error) {
 type apiServerLb struct {
 	Local  string
 	RemoteServers []string
-	HealthyServers []string
+	HealthyServersChan chan[]string
 	rrCounter int
 	healthCheckRules HealthCheck
 	httpClient *http.Client
 }
 
-func (lb *apiServerLb) startHealthChecks() {
+func (lb *apiServerLb) startHealthChecks(healthyServersChan chan []string) {
 	for {
 		newHealthyServers := make([]string, 0)
 		for _, server := range lb.RemoteServers {
@@ -68,22 +68,64 @@ func (lb *apiServerLb) startHealthChecks() {
 			}
 		}
 
-		lb.HealthyServers = newHealthyServers
+		healthyServersChan <- newHealthyServers
 		time.Sleep(time.Duration(lb.healthCheckRules.Period) * time.Second)
 	}
 }
 
-func (lb *apiServerLb) chooseRemote() (string, error) {
-	numberOfHealthyRemotes := len(lb.HealthyServers)
+func (lb *apiServerLb) chooseHealthyRemote(HealthyServers []string) (string, error) {
+	numberOfHealthyRemotes := len(HealthyServers)
 	if numberOfHealthyRemotes == 0 {
 		return "", errors.New("no remote servers are Healthy")
 	}
-	picked := lb.rrCounter % numberOfHealthyRemotes
-	return lb.HealthyServers[picked], nil
+	pickedIdx := lb.rrCounter % numberOfHealthyRemotes
+	picked :=  HealthyServers[pickedIdx]
+
+	lb.rrCounter += 1
+
+	return picked, nil
+}
+
+func (lb *apiServerLb) chooseRemote() (string, error) {
+
+	numberOfRemotes := len(lb.RemoteServers)
+	if numberOfRemotes == 0 {
+		return "", errors.New("no remote servers")
+	}
+	pickedIdx := lb.rrCounter % numberOfRemotes
+	picked :=  lb.RemoteServers[pickedIdx]
+
+	lb.rrCounter += 1
+
+	return picked, nil
+}
+
+func (lb *apiServerLb) removeHealthyRemote(HealthyServers []string, remote string) []string {
+	newHealthyServers := make([]string, 0)
+
+	for _, server := range HealthyServers {
+		if server != remote {
+			newHealthyServers = append(newHealthyServers, server)
+		}
+	}
+
+	return newHealthyServers
+}
+
+func acceptAsChan(listener net.Listener, acceptChan chan net.Conn) {
+	for {
+		localConn, err := listener.Accept()
+		if err != nil {
+			log.Printf("Error accepting connections in lb : %s", err)
+		}
+		acceptChan <- localConn
+	}
 }
 
 func (lb *apiServerLb) Start() error {
-	go lb.startHealthChecks()
+	HealthyServersChan := make(chan []string)
+
+	go lb.startHealthChecks(HealthyServersChan)
 
 	listener, err := net.Listen("tcp", lb.Local)
 	if err != nil {
@@ -91,39 +133,54 @@ func (lb *apiServerLb) Start() error {
 	}
 	defer listener.Close()
 
+	healthyServers := lb.RemoteServers
+	connChan := make(chan net.Conn)
+
+	go acceptAsChan(listener, connChan)
+
 	for {
-		localConn, err := listener.Accept()
-		if err != nil {
-			log.Printf("Error accepting connections in lb : %s", err)
-			return err
-		}
+		select {
+		case conn := <- connChan: {
+			remote, err := lb.chooseHealthyRemote(healthyServers)
+			if err != nil {
+				log.Printf("Error selecting healthy server: %s\n", err)
+				remote, err = lb.chooseRemote()
 
-		remote, err := lb.chooseRemote()
-		if err != nil {
-			log.Printf("Error trying to forward: %s\n", err)
-			continue
-		}
+				if err != nil {
+					log.Printf("Error selecting server: %s\n", err)
+					continue
+				}
+			}
 
-		remoteConn, err := net.Dial("tcp", remote)
-		if err != nil {
-			log.Printf("Error trying to forward: %s\n", err)
-			continue
-		}
+			remoteConn, err := net.Dial("tcp", remote)
+			if err != nil {
+				log.Printf("Error trying to forward: %s\n", err)
+				healthyServers = lb.removeHealthyRemote(healthyServers, remote)
+				continue
+			}
 
-		go lb.forward(localConn, remoteConn)
+			go lb.forward(conn, remoteConn)
+		}
+		case healthyServers = <- HealthyServersChan:
+		}
+	}
+}
+
+func CloseAndLog(conn net.Conn) {
+	err := conn.Close()
+	if err != nil {
+		log.Printf("Error closing socket: %s", err)
 	}
 }
 
 func (lb *apiServerLb) forward(localConn net.Conn, remoteConn net.Conn) {
 
 	copyConn := func (writer, reader net.Conn) {
+		defer CloseAndLog(writer)
+		defer CloseAndLog(reader)
 		_, err := io.Copy(writer, reader)
 		if err != nil {
-			log.Fatalf("io.Copy error: %s", err)
-		}
-		err = writer.Close()
-		if err != nil {
-			log.Fatalf("writer.Close error: %s", err)
+			log.Printf("io.Copy error: %s", err)
 		}
 	}
 
@@ -138,21 +195,18 @@ func main() {
 
 	config, err := readConfiguration(*path)
 	if err != nil {
-		panic(err)
-	}
-
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		log.Fatalf("error reading configuration : %s", err)
 	}
 
 	client := &http.Client{
-		Transport: tr,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
 		Timeout: 5 * time.Second,
 	}
 
 	for {
 		lb := apiServerLb{
-			HealthyServers: make([]string, 0),
 			Local: config.ListenAddr,
 			RemoteServers: config.KubeApiServers,
 			rrCounter: 1,
